@@ -342,6 +342,10 @@ endif()
     add_executable(nonblockingserver
         ${PROJ_DIR}/examples/c/nonblockingserver.c)
     target_link_libraries(nonblockingserver ${STATIC_LIB_NAME})
+
+    add_executable(forwarder
+        ${PROJ_DIR}/examples/c/forwarder.cpp)
+    target_link_libraries(forwarder ${STATIC_LIB_NAME})
 endif()
 
 # ------------------------------------------------------------------------------
