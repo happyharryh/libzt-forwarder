@@ -13,52 +13,58 @@
 
 class Connection {
 public:
-    Connection(int fd) : fd(fd) {}
-    virtual ssize_t read(void* buf, size_t count) const { return ::read(fd, buf, count); }
-    virtual ssize_t write(const void* buf, size_t count) const { return ::write(fd, buf, count); }
-    virtual int shutdown_rd() const { return shutdown(fd, SHUT_RD); }
-    virtual int shutdown_wr() const { return shutdown(fd, SHUT_WR); }
-    virtual int close() const { return ::close(fd); }
+    Connection(int fd) : fd(fd), stopped(false)
+        { }
+    virtual ssize_t read(void* buf, size_t count) const
+        { return stopped ? -1 : ::read(fd, buf, count); }
+    virtual ssize_t write(const void* buf, size_t count) const
+        { return stopped ? -1 : ::write(fd, buf, count); }
+    virtual int shutdown_wr() const
+        { return stopped ? -1 : shutdown(fd, SHUT_WR); }
+    virtual int close() const
+        { return ::close(fd); }
+    void stop()
+        { stopped = true; }
 protected:
     int fd;
+    bool stopped;
 };
 
 class ZTConnection : public Connection {
 public:
-    ZTConnection(int fd) : Connection(fd) {}
-    virtual ssize_t read(void* buf, size_t count) const { return zts_read(fd, buf, count); }
-    virtual ssize_t write(const void* buf, size_t count) const { return zts_write(fd, buf, count); }
-    virtual int shutdown_rd() const { return zts_shutdown_rd(fd); }
-    virtual int shutdown_wr() const { return zts_shutdown_wr(fd); }
-    virtual int close() const { return zts_close(fd); }
+    ZTConnection(int fd) : Connection(fd)
+        { }
+    virtual ssize_t read(void* buf, size_t count) const
+        { return stopped ? -1 : zts_read(fd, buf, count); }
+    virtual ssize_t write(const void* buf, size_t count) const
+        { return stopped ? -1 : zts_write(fd, buf, count); }
+    virtual int shutdown_wr() const
+        { return stopped ? -1 : zts_shutdown_wr(fd); }
+    virtual int close() const
+        { return zts_close(fd); }
 };
 
 void transport(Connection *src, Connection *dst) {
     char buf[4096];
-    int r_count, w_count, w_head;
+    int r_count;
 
-    do {
-        if ((r_count = src->read(buf, 4096)) == -1) {
-            printf("read\n");
-            exit(1);
+    for (;;) {
+        if ((r_count = src->read(buf, 4096)) <= 0) {
+            src->stop();
+            dst->shutdown_wr();
+            return;
         }
 
-        for (w_head = 0; w_head < r_count; w_head += w_count) {
-            if ((w_count = dst->write(buf + w_head, r_count - w_head)) == -1) {
-                printf("write\n");
-                exit(1);
-            }
+        if (dst->write(buf, r_count) != r_count) {
+            src->stop();
+            return;
         }
-    } while (r_count > 0);
-
-    src->shutdown_rd();
-    dst->shutdown_wr();
+    }
 }
 
 void handle(int local_fd, const char* remote_addr, int remote_port) {
-    // Connect to remote host
-    int remote_fd;
-    while ((remote_fd = zts_tcp_client(remote_addr, remote_port)) < 0) {
+    int remote_fd = zts_socket(AF_INET, SOCK_STREAM, 0);
+    while (zts_connect(remote_fd, remote_addr, remote_port, 0) < 0) {
         printf("Re-attempting to connect...\n");
     }
 
