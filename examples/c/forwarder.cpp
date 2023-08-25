@@ -48,7 +48,7 @@ void transport(Connection *src, Connection *dst) {
     char buf[4096];
     int r_count;
 
-    for (;;) {
+    while (true) {
         if ((r_count = src->read(buf, 4096)) <= 0) {
             src->stop();
             dst->shutdown_wr();
@@ -62,7 +62,7 @@ void transport(Connection *src, Connection *dst) {
     }
 }
 
-void handle(int local_fd, const char* remote_addr, int remote_port) {
+void handle(int local_fd, const char* remote_addr, unsigned short remote_port) {
     int remote_fd = zts_socket(AF_INET, SOCK_STREAM, 0);
     while (zts_connect(remote_fd, remote_addr, remote_port, 0) < 0) {
         printf("Re-attempting to connect...\n");
@@ -71,11 +71,9 @@ void handle(int local_fd, const char* remote_addr, int remote_port) {
     Connection local_conn(local_fd);
     ZTConnection remote_conn(remote_fd);
 
-    std::thread local_to_remote(transport, &local_conn, &remote_conn);
-    std::thread remote_to_local(transport, &remote_conn, &local_conn);
-
-    local_to_remote.join();
-    remote_to_local.join();
+    std::thread remote2local(transport, &remote_conn, &local_conn);
+    transport(&local_conn, &remote_conn);  // local2remote
+    remote2local.join();
 
     local_conn.close();
     remote_conn.close();
@@ -83,9 +81,9 @@ void handle(int local_fd, const char* remote_addr, int remote_port) {
 
 void serve(const char* addr_pair) {
     char local_addr[16], remote_addr[16];
-    int local_port, remote_port;
+    unsigned short local_port, remote_port;
 
-    sscanf(addr_pair, "%[0-9.]:%u-%[0-9.]:%u", local_addr, &local_port, remote_addr, &remote_port);
+    sscanf(addr_pair, "%[0-9.]:%hu-%[0-9.]:%hu", local_addr, &local_port, remote_addr, &remote_port);
 
     // Forwarder
     sockaddr_in local_address;
@@ -107,9 +105,9 @@ void serve(const char* addr_pair) {
         exit(1);
     }
 
-    printf("Start Server: %s:%u -> %s:%u\n", local_addr, local_port, remote_addr, remote_port);
+    printf("Start Server: %s:%hu -> %s:%hu\n", local_addr, local_port, remote_addr, remote_port);
 
-    for (;;) {
+    while (true) {
         int local_fd;
         if ((local_fd = accept(local_socket, NULL, NULL)) == -1) {
             printf("accept\n");
@@ -173,11 +171,13 @@ int main(int argc, char** argv) {
 
     login(storage_path, net_id);
 
-    std::thread *p_thread;
     for (int i = 3; i < argc; ++i) {
-        p_thread = new std::thread(serve, argv[i]);
+        std::thread(serve, argv[i]).detach();
     }
-    p_thread->join();
+
+    while (true) {
+        zts_util_delay(500);   // Idle indefinitely
+    }
 
     return 0;
 }
