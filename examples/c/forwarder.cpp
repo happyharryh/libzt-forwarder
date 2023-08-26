@@ -13,8 +13,9 @@
 
 class Connection {
 public:
-    Connection(int fd) : fd(fd), stopped(false)
-        { }
+    Connection(int fd) : fd(fd), stopped(false) { }
+    virtual ~Connection() { }
+
     virtual ssize_t read(void* buf, size_t count) const
         { return stopped ? -1 : ::read(fd, buf, count); }
     virtual ssize_t write(const void* buf, size_t count) const
@@ -25,6 +26,7 @@ public:
         { return ::close(fd); }
     void stop()
         { stopped = true; }
+
 protected:
     int fd;
     bool stopped;
@@ -32,8 +34,8 @@ protected:
 
 class ZTConnection : public Connection {
 public:
-    ZTConnection(int fd) : Connection(fd)
-        { }
+    using Connection::Connection;
+
     virtual ssize_t read(void* buf, size_t count) const
         { return stopped ? -1 : zts_read(fd, buf, count); }
     virtual ssize_t write(const void* buf, size_t count) const
@@ -42,6 +44,125 @@ public:
         { return stopped ? -1 : zts_shutdown_wr(fd); }
     virtual int close() const
         { return zts_close(fd); }
+};
+
+class Listener {
+public:
+    Listener(int local_socket) : local_socket(local_socket) { }
+    virtual ~Listener() { }
+
+    virtual Connection *accept() const {
+        int local_fd;
+        if ((local_fd = ::accept(local_socket, NULL, NULL)) < 0) {
+            printf("accept\n");
+            exit(1);
+        }
+        return new Connection(local_fd);
+    }
+
+    static Listener *listen(const char* local_addr, unsigned short local_port) {
+        sockaddr_in local_address;
+        local_address.sin_family = AF_INET;
+        local_address.sin_addr.s_addr = inet_addr(local_addr);
+        local_address.sin_port = htons(local_port);
+
+        int local_socket;
+        if((local_socket = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
+            printf("socket\n");
+            exit(1);
+        }
+        if (bind(local_socket, (sockaddr*)&local_address, sizeof(local_address)) < 0) {
+            printf("bind\n");
+            exit(1);
+        }
+        if (::listen(local_socket, 40) < 0) {
+            printf("listen\n");
+            exit(1);
+        }
+        return new Listener(local_socket);
+    }
+
+protected:
+    int local_socket;
+};
+
+class ZTListener : public Listener {
+public:
+    using Listener::Listener;
+
+    virtual Connection *accept() const {
+        char remote_addr[ZTS_IP_MAX_STR_LEN];
+        unsigned short port;
+
+        int local_fd;
+        if ((local_fd = zts_accept(local_socket, remote_addr, ZTS_IP_MAX_STR_LEN, &port)) < 0) {
+            printf("accept\n");
+            exit(1);
+        }
+        return new ZTConnection(local_fd);
+    }
+
+    static ZTListener *listen(const char* local_addr, unsigned short local_port) {
+        int local_socket;
+        if((local_socket = zts_socket(ZTS_AF_INET, ZTS_SOCK_STREAM, 0)) < 0) {
+            printf("socket\n");
+            exit(1);
+        }
+        if (zts_bind(local_socket, local_addr, local_port) < 0) {
+            printf("bind\n");
+            exit(1);
+        }
+        if (zts_listen(local_socket, 100) < 0) {
+            printf("listen\n");
+            exit(1);
+        }
+        return new ZTListener(local_socket);
+    }
+};
+
+class Dialer {
+public:
+    Dialer(const char* remote_addr, unsigned short remote_port) :
+        remote_addr(remote_addr), remote_port(remote_port) { }
+    virtual ~Dialer() { }
+
+    virtual Connection *dial() const {
+        sockaddr_in remote_address;
+        remote_address.sin_family = AF_INET;
+        remote_address.sin_addr.s_addr = inet_addr(remote_addr);
+        remote_address.sin_port = htons(remote_port);
+
+        int remote_fd;
+        if ((remote_fd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
+            printf("socket\n");
+            exit(1);
+        }
+        if (connect(remote_fd, (sockaddr*)&remote_address, sizeof(remote_address)) < 0) {
+            printf("connect\n");
+            exit(1);
+        }
+        return new Connection(remote_fd);
+    }
+
+protected:
+    const char* remote_addr;
+    unsigned short remote_port;
+};
+
+class ZTDialer : public Dialer {
+    using Dialer::Dialer;
+
+    virtual Connection *dial() const {
+        int remote_fd;
+        if ((remote_fd = zts_socket(ZTS_AF_INET, ZTS_SOCK_STREAM, 0)) < 0) {
+            printf("socket\n");
+            exit(1);
+        }
+        while (zts_connect(remote_fd, remote_addr, remote_port, 0) < 0) {
+            printf("Re-attempting to connect...\n");
+        }
+        return new ZTConnection(remote_fd);
+    }
 };
 
 void transport(Connection *src, Connection *dst) {
@@ -62,59 +183,44 @@ void transport(Connection *src, Connection *dst) {
     }
 }
 
-void handle(int local_fd, const char* remote_addr, unsigned short remote_port) {
-    int remote_fd = zts_socket(AF_INET, SOCK_STREAM, 0);
-    while (zts_connect(remote_fd, remote_addr, remote_port, 0) < 0) {
-        printf("Re-attempting to connect...\n");
-    }
+void handle(Connection *local_conn, Dialer *dialer) {
+    Connection *remote_conn = dialer->dial();
 
-    Connection local_conn(local_fd);
-    ZTConnection remote_conn(remote_fd);
-
-    std::thread remote2local(transport, &remote_conn, &local_conn);
-    transport(&local_conn, &remote_conn);  // local2remote
+    std::thread remote2local(transport, remote_conn, local_conn);
+    transport(local_conn, remote_conn);  // local2remote
     remote2local.join();
 
-    local_conn.close();
-    remote_conn.close();
+    local_conn->close();
+    remote_conn->close();
+
+    delete local_conn;
+    delete remote_conn;
 }
 
 void serve(const char* addr_pair) {
     char local_addr[16], remote_addr[16];
     unsigned short local_port, remote_port;
 
-    sscanf(addr_pair, "%[0-9.]:%hu-%[0-9.]:%hu", local_addr, &local_port, remote_addr, &remote_port);
+    sscanf(addr_pair, "%[v0-9.]:%hu-%[v0-9.]:%hu", local_addr, &local_port, remote_addr, &remote_port);
 
-    // Forwarder
-    sockaddr_in local_address;
-    local_address.sin_family = AF_INET;
-    local_address.sin_addr.s_addr = inet_addr(local_addr);
-    local_address.sin_port = htons(local_port);
+    Listener *listener;
+    if (strncmp(local_addr, "v", 1) == 0) {
+        listener = ZTListener::listen(local_addr + 1, local_port);
+    } else {
+        listener = Listener::listen(local_addr, local_port);
+    }
 
-    int local_socket;
-    if((local_socket = socket(AF_INET, SOCK_STREAM, 0)) == -1) {
-        printf("socket\n");
-        exit(1);
-    }
-    if (bind(local_socket, (sockaddr*)&local_address, sizeof(local_address)) == -1) {
-        printf("bind\n");
-        exit(1);
-    }
-    if (listen(local_socket, 40) == -1) {
-        printf("listen\n");
-        exit(1);
+    Dialer *dialer;
+    if (strncmp(remote_addr, "v", 1) == 0) {
+        dialer = new ZTDialer(remote_addr + 1, remote_port);
+    } else {
+        dialer = new Dialer(remote_addr, remote_port);
     }
 
     printf("Start Server: %s:%hu -> %s:%hu\n", local_addr, local_port, remote_addr, remote_port);
 
     while (true) {
-        int local_fd;
-        if ((local_fd = accept(local_socket, NULL, NULL)) == -1) {
-            printf("accept\n");
-            exit(1);
-        }
-
-        std::thread(handle, local_fd, remote_addr, remote_port).detach();
+        std::thread(handle, listener->accept(), dialer).detach();
     }
 }
 
